@@ -1,0 +1,129 @@
+name: Clean workflow run logs (on-demand)
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "Scope of cleanup: 'run' | 'workflow' | 'repo' | 'older_than'"
+        required: true
+        default: "run"
+      run_id:
+        description: "Run id to clean (required when scope=run)"
+        required: false
+      workflow_file:
+        description: "Workflow file name or id (e.g. ci.yml). Used when scope=workflow"
+        required: false
+      older_than_days:
+        description: "When scope=older_than, delete logs older than this many days"
+        required: false
+      confirm:
+        description: "Type CONFIRM to actually delete logs. Any other value -> dry-run"
+        required: true
+        default: "DRY_RUN"
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  clean-logs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show inputs
+        run: |
+          echo "Scope: ${{ github.event.inputs.scope }}"
+          echo "run_id: ${{ github.event.inputs.run_id }}"
+          echo "workflow_file: ${{ github.event.inputs.workflow_file }}"
+          echo "older_than_days: ${{ github.event.inputs.older_than_days }}"
+          echo "confirm: ${{ github.event.inputs.confirm }}"
+
+      - name: Delete workflow run logs (uses octokit)
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const inputs = github.context.payload.inputs || {};
+            const scope = (inputs.scope || 'run').toLowerCase();
+            const confirm = inputs.confirm || 'DRY_RUN';
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const olderDays = inputs.older_than_days ? parseInt(inputs.older_than_days, 10) : null;
+
+            function olderThan(dateStr, days) {
+              if (!days) return false;
+              const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+              return new Date(dateStr).getTime() < cutoff;
+            }
+
+            async function deleteLogsForRunId(runId) {
+              try {
+                if (confirm === 'CONFIRM') {
+                  await octokit.rest.actions.deleteWorkflowRunLogs({
+                    owner,
+                    repo,
+                    run_id: runId
+                  });
+                  core.info(`Deleted logs for run ${runId}`);
+                } else {
+                  core.info(`[DRY-RUN] Would delete logs for run ${runId}`);
+                }
+                return { id: runId, deleted: confirm === 'CONFIRM' };
+              } catch (err) {
+                core.warning(`Failed to delete logs for run ${runId}: ${err.message || err}`);
+                return { id: runId, error: (err.message || String(err)) };
+              }
+            }
+
+            if (scope === 'run') {
+              const runId = inputs.run_id;
+              if (!runId) {
+                throw new Error("When scope='run' you must provide run_id.");
+              }
+              core.info(`Targeting single run ${runId}`);
+              const result = await deleteLogsForRunId(runId);
+              core.setOutput('results', JSON.stringify([result]));
+              return;
+            }
+
+            // For repo/workflow/older_than scopes: fetch runs, filter and delete logs
+            let runs = [];
+            if (scope === 'workflow') {
+              const wf = inputs.workflow_file;
+              if (!wf) throw new Error("When scope='workflow' you must provide workflow_file (file name or workflow id).");
+              core.info(`Listing runs for workflow: ${wf}`);
+              runs = await octokit.paginate(octokit.rest.actions.listWorkflowRuns, {
+                owner,
+                repo,
+                workflow_id: wf,
+                per_page: 100
+              });
+            } else if (scope === 'repo' || scope === 'older_than') {
+              core.info(`Listing all runs for repo ${owner}/${repo}`);
+              runs = await octokit.paginate(octokit.rest.actions.listWorkflowRunsForRepo, {
+                owner,
+                repo,
+                per_page: 100
+              });
+            } else {
+              throw new Error(`Unknown scope: ${scope}`);
+            }
+
+            core.info(`Total runs fetched: ${runs.length}`);
+
+            // Filter if older_than_days provided or scope is older_than
+            const filtered = runs.filter(r => {
+              if (scope === 'older_than' || olderDays) {
+                return olderThan(r.created_at, olderDays || parseInt(inputs.older_than_days, 10));
+              }
+              return true;
+            });
+
+            core.info(`Runs to process after filtering: ${filtered.length}`);
+
+            const results = [];
+            for (const run of filtered) {
+              core.info(`Processing run ${run.id} (workflow: ${run.name || run.head_repository?.name || 'unknown'}, created_at: ${run.created_at})`);
+              results.push(await deleteLogsForRunId(run.id));
+            }
+
+            core.setOutput('results', JSON.stringify(results));

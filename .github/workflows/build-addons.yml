@@ -1,0 +1,86 @@
+name: Build VSTO Add-in
+
+on:
+  push:
+#     branches: [ "main" ]
+#   pull_request:
+#     branches: [ "main" ]
+  workflow_dispatch: # Allows manual triggering
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    env:
+      # Update this to match your solution filename
+      SOLUTION_FILE: 'Red Ink.sln'
+      # Update this to match your specific VSTO project folder name
+      PROJECT_FOLDER: 'Red Ink for Word'
+      Configuration: Release
+
+    steps:
+
+    # 🔐 Security Step: Store Si Certificate
+    - name: Decode and Store Signing Certificate
+      run: |
+        # Decode the base64-encoded PFX certificate and save it to a file
+        $pfx_cert_byte = [System.Convert]::FromBase64String("${{ secrets.SIGNING_CERT_BASE64 }}")
+        $certificatePath = Join-Path -Path "${{ github.workspace }}" -ChildPath "codesign_certificate.pfx"
+        [IO.File]::WriteAllBytes($certificatePath, $pfx_cert_byte)
+        # Import the certificate into the Current User's Personal store
+        Import-PfxCertificate -FilePath $certificatePath -CertStoreLocation "Cert:\CurrentUser\My" -Password (ConvertTo-SecureString -String "${{ secrets.SIGNING_CERT_PASSWORD }}" -AsPlainText -force)
+        # Obtain certificate's thumbprint and save it in an environment variable for later use
+        # $cert = Get-PfxCertificate -FilePath $certificatePath -Password (ConvertTo-SecureString -String "${{ secrets.SIGNING_CERT_PASSWORD }}" -AsPlainText -force)
+        # Write-Host "Certificate Thumbprint: $($cert.Thumbprint)"
+        # $env:SIGNING_CERT_THUMBPRINT = $cert.Thumbprint
+        # cleanup
+        Remove-Item -Path $certificatePath -Force        
+      shell: powershell
+
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Setup NuGet
+      uses: NuGet/setup-nuget@v2
+
+    # 🛡️ Defensive Step: Install VSTO Workload
+    # Although VS2022 is pre-installed, the Office/SharePoint workload is sometimes missing or minimal.
+    # This ensures the build targets (VSTO 4.0) are present.
+    - name: Install VSTO Workload
+      run: |
+        Write-Host "Verifying VSTO Workload..."
+        & "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vs_installer.exe" modify `
+          --installPath "C:\Program Files\Microsoft Visual Studio\2022\Enterprise" `
+          --add Microsoft.VisualStudio.Workload.Office `
+          --add Microsoft.VisualStudio.Component.TeamOffice `
+          --quiet --norestart
+      shell: powershell
+
+    - name: Restore NuGet Packages
+      run: nuget restore "${{github.workspace}}\${{ env.SOLUTION_FILE }}"
+
+    # 🏗️ Build & Publish
+    # We pass the certificate path and password securely to MSBuild
+    - name: Build and Publish
+      run: |
+        msbuild "${{ env.SOLUTION_FILE }}" `
+        /p:Configuration=${{ env.Configuration }} `
+        /p:Platform="Any CPU" `
+        /t:Publish `
+        /p:ManifestCertificateThumbprint="${{ secrets.SIGNING_CERT_THUMBPRINT }}" `
+        /p:DefineConstants="UseOfficeInterop" `
+        /p:VisualStudioVersion="17.0" `
+        /v:minimal
+
+    # 📦 Artifacts
+    # VSTO builds output to bin/Release/app.publish - this is what we want to save.
+    - name: Upload VSTO Installer
+      uses: actions/upload-artifact@v4
+      with:
+        name: VSTO-Installer
+        path: ${{ env.PROJECT_FOLDER }}/bin/${{ env.Configuration }}/app.publish/
+        if-no-files-found: error
+      if: ${{ vars.BUPLOAD == 'true' }}
